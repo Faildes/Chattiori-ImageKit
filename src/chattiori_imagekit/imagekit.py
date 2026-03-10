@@ -133,6 +133,48 @@ def _lineart_base(arr: np.ndarray, strength: float = 2.4) -> np.ndarray:
     return _gray_to_rgb(np.clip(line, 0.0, 255.0))
 
 
+def _radial_mask(h: int, w: int, start: float = 0.25, end: float = 1.0) -> np.ndarray:
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx = (w - 1) / 2.0
+    cy = (h - 1) / 2.0
+    nx = (xx - cx) / max(cx, 1.0)
+    ny = (yy - cy) / max(cy, 1.0)
+    r = np.sqrt(nx * nx + ny * ny)
+    m = np.clip((r - start) / max(end - start, 1e-6), 0.0, 1.0)
+    return m[..., None].astype(np.float32)
+
+
+def _vertical_band_mask(
+    h: int,
+    w: int,
+    center: float = 0.5,
+    half_width: float = 0.18,
+    softness: float = 0.18,
+) -> np.ndarray:
+    y = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None]
+    d = np.abs(y - center)
+    m = np.clip((d - half_width) / max(softness, 1e-6), 0.0, 1.0)
+    m = np.repeat(m, w, axis=1)
+    return m[..., None].astype(np.float32)
+
+
+def _motion_blur_roll(
+    arr: np.ndarray,
+    radius: int = 6,
+    axis: int = 1,
+    diagonal: bool = False,
+) -> np.ndarray:
+    out = np.zeros_like(arr, dtype=np.float32)
+    count = 0
+    for i in range(-radius, radius + 1):
+        if diagonal:
+            shifted = np.roll(np.roll(arr, i, axis=0), i, axis=1)
+        else:
+            shifted = np.roll(arr, i, axis=axis)
+        out += shifted
+        count += 1
+    return _clip255(out / float(max(count, 1)))
+
 # ------------------------------------------------------------
 # Filters
 # ------------------------------------------------------------
@@ -480,6 +522,203 @@ def _filter_medianclean(arr: np.ndarray) -> np.ndarray:
     return _pil_filter_rgb(arr, ImageFilter.MedianFilter(size=3))
     
 
+def _filter_blur(arr: np.ndarray) -> np.ndarray:
+    return _blur_rgb(arr, 2.0)
+
+
+def _filter_softblur(arr: np.ndarray) -> np.ndarray:
+    return _blur_rgb(arr, 1.2)
+
+
+def _filter_heavyblur(arr: np.ndarray) -> np.ndarray:
+    return _blur_rgb(arr, 4.8)
+
+
+def _filter_darkbloom(arr: np.ndarray) -> np.ndarray:
+    dark = 255.0 - _to_gray_luma(arr)[..., 0]
+    spread = _blur_rgb(_gray_to_rgb(dark), 8.0)
+    out = arr - spread * 0.32
+    out = _adjust_contrast(out, 1.03)
+    return _clip255(out)
+
+
+def _filter_blackbloom(arr: np.ndarray) -> np.ndarray:
+    dark = 255.0 - _to_gray_luma(arr)[..., 0]
+    spread = _blur_rgb(_gray_to_rgb(dark), 12.0)[..., 0] / 255.0
+    out = arr * (1.0 - spread[..., None] * 0.40)
+    out = _adjust_contrast(out, 1.05)
+    return _clip255(out)
+
+
+def _filter_vignette(arr: np.ndarray) -> np.ndarray:
+    h, w = arr.shape[:2]
+    m = _radial_mask(h, w, start=0.28, end=1.0)
+    out = arr * (1.0 - m * 0.28)
+    return _clip255(out)
+
+
+def _filter_strongvignette(arr: np.ndarray) -> np.ndarray:
+    h, w = arr.shape[:2]
+    m = _radial_mask(h, w, start=0.22, end=1.0)
+    out = arr * (1.0 - m * 0.50)
+    return _clip255(out)
+
+
+def _filter_tiltshift(arr: np.ndarray) -> np.ndarray:
+    h, w = arr.shape[:2]
+    blur = _blur_rgb(arr, 5.0)
+    m = _vertical_band_mask(h, w, center=0.5, half_width=0.16, softness=0.20)
+    out = arr * (1.0 - m) + blur * m
+    out = _adjust_saturation(out, 1.03)
+    return _clip255(out)
+
+
+def _filter_motionblurh(arr: np.ndarray) -> np.ndarray:
+    return _motion_blur_roll(arr, radius=7, axis=1)
+
+
+def _filter_motionblurv(arr: np.ndarray) -> np.ndarray:
+    return _motion_blur_roll(arr, radius=7, axis=0)
+
+
+def _filter_motionblurdiag(arr: np.ndarray) -> np.ndarray:
+    return _motion_blur_roll(arr, radius=7, diagonal=True)
+
+
+def _filter_orton(arr: np.ndarray) -> np.ndarray:
+    blur = _blur_rgb(arr, 4.0)
+    out = _screen_blend(arr, blur)
+    out = _adjust_contrast(out, 0.94)
+    out = _adjust_saturation(out, 1.03)
+    return _clip255(out)
+
+
+def _filter_halation(arr: np.ndarray) -> np.ndarray:
+    lum = _to_gray_luma(arr)[..., 0]
+    mask = np.clip((lum - 170.0) / 85.0, 0.0, 1.0)
+    glow = arr * np.array([1.18, 0.92, 0.82], dtype=np.float32)
+    glow = _blur_rgb(glow, 7.0)
+    out = arr + glow * mask[..., None] * 0.22
+    return _clip255(out)
+
+
+def _filter_lowkey(arr: np.ndarray) -> np.ndarray:
+    out = arr * 0.82
+    out = _adjust_contrast(out, 1.16)
+    out = _adjust_saturation(out, 0.96)
+    return _clip255(out)
+
+
+def _filter_highkey(arr: np.ndarray) -> np.ndarray:
+    out = arr * 0.96 + 22.0
+    out = _adjust_contrast(out, 0.92)
+    out = _adjust_saturation(out, 0.98)
+    return _clip255(out)
+
+
+def _filter_desaturate(arr: np.ndarray) -> np.ndarray:
+    return _adjust_saturation(arr, 0.25)
+
+
+def _filter_hypersaturate(arr: np.ndarray) -> np.ndarray:
+    out = _adjust_saturation(arr, 1.75)
+    out = _adjust_contrast(out, 1.05)
+    return _clip255(out)
+
+
+def _filter_bleachbypass(arr: np.ndarray) -> np.ndarray:
+    out = _adjust_saturation(arr, 0.30)
+    out = _adjust_contrast(out, 1.25)
+    out = out * 1.02
+    return _clip255(out)
+
+
+def _filter_cyanotype(arr: np.ndarray) -> np.ndarray:
+    gray = _to_gray_luma(arr)[..., 0] / 255.0
+    c1 = np.array([8.0, 28.0, 52.0], dtype=np.float32)
+    c2 = np.array([190.0, 225.0, 255.0], dtype=np.float32)
+    out = c1 * (1.0 - gray[..., None]) + c2 * gray[..., None]
+    return _clip255(out)
+
+
+def _filter_rosetint(arr: np.ndarray) -> np.ndarray:
+    out = arr * np.array([1.08, 0.96, 1.04], dtype=np.float32)
+    out += np.array([10.0, -2.0, 6.0], dtype=np.float32)
+    out = _adjust_saturation(out, 1.02)
+    return _clip255(out)
+
+
+def _filter_bronze(arr: np.ndarray) -> np.ndarray:
+    out = arr * np.array([1.08, 0.97, 0.84], dtype=np.float32)
+    out += np.array([10.0, 4.0, -6.0], dtype=np.float32)
+    out = _adjust_contrast(out, 1.06)
+    return _clip255(out)
+
+
+def _filter_chromablur(arr: np.ndarray) -> np.ndarray:
+    blur = _blur_rgb(arr, 3.2)
+    luma_orig = _to_gray_luma(arr)
+    luma_blur = _to_gray_luma(blur)
+    out = luma_orig + (blur - luma_blur)
+    return _clip255(out)
+
+
+def _filter_edgeglow(arr: np.ndarray) -> np.ndarray:
+    edge = _simple_edges_gray(arr, strength=3.0) / 255.0
+    glow = np.zeros_like(arr, dtype=np.float32)
+    glow[..., 0] = edge * 255.0
+    glow[..., 1] = edge * 245.0
+    glow[..., 2] = edge * 220.0
+    out = _screen_blend(arr * 0.92, glow)
+    return _clip255(out)
+
+
+def _filter_darkedges(arr: np.ndarray) -> np.ndarray:
+    edge = _simple_edges_gray(arr, strength=2.8) / 255.0
+    out = arr * (1.0 - edge[..., None] * 0.55)
+    return _clip255(out)
+
+
+def _filter_penciledges(arr: np.ndarray) -> np.ndarray:
+    sk = _filter_sketch(arr)
+    ln = _filter_lineart(arr)
+    out = sk * 0.72 + ln * 0.28
+    out = _adjust_contrast(out, 1.05)
+    return _clip255(out)
+
+
+def _filter_shadowlift(arr: np.ndarray) -> np.ndarray:
+    lum = arr.mean(axis=2, keepdims=True)
+    m = np.clip((145.0 - lum) / 145.0, 0.0, 1.0)
+    lifted = arr + (255.0 - arr) * 0.22
+    out = arr * (1.0 - m) + lifted * m
+    return _clip255(out)
+
+
+def _filter_highlightrolloff(arr: np.ndarray) -> np.ndarray:
+    lum = arr.mean(axis=2, keepdims=True)
+    m = np.clip((lum - 180.0) / 75.0, 0.0, 1.0)
+    soft = arr - np.maximum(arr - 180.0, 0.0) * 0.45
+    out = arr * (1.0 - m) + soft * m
+    return _clip255(out)
+
+
+def _filter_softcontrast(arr: np.ndarray) -> np.ndarray:
+    return _adjust_contrast(arr, 0.85)
+
+
+def _filter_hardcontrast(arr: np.ndarray) -> np.ndarray:
+    return _adjust_contrast(arr, 1.35)
+
+
+def _filter_radialblur(arr: np.ndarray) -> np.ndarray:
+    h, w = arr.shape[:2]
+    blur = _blur_rgb(arr, 4.5)
+    m = _radial_mask(h, w, start=0.18, end=0.95)
+    out = arr * (1.0 - m) + blur * m
+    return _clip255(out)
+
+
 FILTERS: dict[str, tuple[str, callable]] = {
     'sepia':        ('Sepia', _filter_sepia),
     'cyber':        ('Cyber', _filter_cyber),
@@ -527,6 +766,36 @@ FILTERS: dict[str, tuple[str, callable]] = {
     'dehaze':        ('Dehaze', _filter_dehaze),
     'toon':          ('Toon', _filter_toon),
     'medianclean':   ('MedianClean', _filter_medianclean),
+    'blur':             ('Blur', _filter_blur),
+    'softblur':         ('SoftBlur', _filter_softblur),
+    'heavyblur':        ('HeavyBlur', _filter_heavyblur),
+    'darkbloom':        ('DarkBloom', _filter_darkbloom),
+    'blackbloom':       ('BlackBloom', _filter_blackbloom),
+    'vignette':         ('Vignette', _filter_vignette),
+    'strongvignette':   ('StrongVignette', _filter_strongvignette),
+    'tiltshift':        ('TiltShift', _filter_tiltshift),
+    'motionblurh':      ('MotionBlurH', _filter_motionblurh),
+    'motionblurv':      ('MotionBlurV', _filter_motionblurv),
+    'motionblurdiag':   ('MotionBlurDiag', _filter_motionblurdiag),
+    'orton':            ('Orton', _filter_orton),
+    'halation':         ('Halation', _filter_halation),
+    'lowkey':           ('LowKey', _filter_lowkey),
+    'highkey':          ('HighKey', _filter_highkey),
+    'desaturate':       ('Desaturate', _filter_desaturate),
+    'hypersaturate':    ('HyperSaturate', _filter_hypersaturate),
+    'bleachbypass':     ('BleachBypass', _filter_bleachbypass),
+    'cyanotype':        ('Cyanotype', _filter_cyanotype),
+    'rosetint':         ('RoseTint', _filter_rosetint),
+    'bronze':           ('Bronze', _filter_bronze),
+    'chromablur':       ('ChromaBlur', _filter_chromablur),
+    'edgeglow':         ('EdgeGlow', _filter_edgeglow),
+    'darkedges':        ('DarkEdges', _filter_darkedges),
+    'penciledges':      ('PencilEdges', _filter_penciledges),
+    'shadowlift':       ('ShadowLift', _filter_shadowlift),
+    'highlightrolloff': ('HighlightRollOff', _filter_highlightrolloff),
+    'softcontrast':     ('SoftContrast', _filter_softcontrast),
+    'hardcontrast':     ('HardContrast', _filter_hardcontrast),
+    'radialblur':       ('RadialBlur', _filter_radialblur),
 
     # alias
     'cyberpunk':    ('Cyber', _filter_cyber),
@@ -539,6 +808,17 @@ FILTERS: dict[str, tuple[str, callable]] = {
     'outline':       ('LineArt', _filter_lineart),
     'comic':         ('Toon', _filter_toon),
     'denoise':       ('MedianClean', _filter_medianclean),
+    'blursoft':         ('SoftBlur', _filter_softblur),
+    'blurheavy':        ('HeavyBlur', _filter_heavyblur),
+    'darkglow':         ('DarkBloom', _filter_darkbloom),
+    'blackglow':        ('BlackBloom', _filter_blackbloom),
+    'motionblurx':      ('MotionBlurH', _filter_motionblurh),
+    'motionblury':      ('MotionBlurV', _filter_motionblurv),
+    'motionblur45':     ('MotionBlurDiag', _filter_motionblurdiag),
+    'satdown':          ('Desaturate', _filter_desaturate),
+    'satup':            ('HyperSaturate', _filter_hypersaturate),
+    'liftshadows':      ('ShadowLift', _filter_shadowlift),
+    'rolloffhighlights':('HighlightRollOff', _filter_highlightrolloff),
 }
 
 
